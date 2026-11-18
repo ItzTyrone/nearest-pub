@@ -75,20 +75,23 @@ export async function fetchPubs(lat, lon, radius, { signal } = {}) {
   const query = buildQuery(lat, lon, radius);
 
   const master = new AbortController();
-  const masterTimer = setTimeout(() => master.abort(), 6000);
-  if (signal) signal.addEventListener('abort', () => master.abort(), { once: true });
+  const masterTimer = setTimeout(() => { try { master.abort(); } catch {} }, 6000);
+  if (signal) signal.addEventListener('abort', () => { try { master.abort(); } catch {} }, { once: true });
 
   const attempts = ENDPOINTS.map((ep) => {
     return fetchOnce(ep, query, master.signal)
       .then((data) => {
-        // first success wins; abort the rest
         try { master.abort(); } catch {}
         return { data, source: ep, cached: false };
       });
   });
 
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => { try { master.abort(); } catch {} reject(new Error('timeout')); }, 6000)
+  );
+
   try {
-    const res = await Promise.any(attempts);
+    const res = await Promise.race([Promise.any(attempts), timeoutPromise]);
     clearTimeout(masterTimer);
     writeCache(key, res.data);
     return res;
@@ -96,7 +99,9 @@ export async function fetchPubs(lat, lon, radius, { signal } = {}) {
     clearTimeout(masterTimer);
     const c = readCache(key);
     if (c) return { data: c.data, source: 'cache', cached: true };
-    const msg = (agg && agg.errors && agg.errors[0] && agg.errors[0].message) || 'no pubs found';
+    let msg = 'no pubs found';
+    if (agg && agg.errors && agg.errors[0] && agg.errors[0].message) msg = agg.errors[0].message;
+    else if (agg && agg.message) msg = agg.message;
     throw new Error(msg);
   }
 }
