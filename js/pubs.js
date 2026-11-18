@@ -8,7 +8,6 @@ const ENDPOINTS = [
 ];
 
 const TTL = 10 * 60 * 1000; // 10 min
-const REQ_TIMEOUT = 5000;
 
 function cacheKey(lat, lon, r) {
   return `pubs:${lat.toFixed(3)}:${lon.toFixed(3)}:${r}`;
@@ -75,34 +74,26 @@ export async function fetchPubs(lat, lon, radius, { signal } = {}) {
   const key = cacheKey(lat, lon, radius);
   const query = buildQuery(lat, lon, radius);
 
-  // race all mirrors in parallel; take the first success
-  const controllers = ENDPOINTS.map(() => new AbortController());
-  const attempts = ENDPOINTS.map((ep, i) => {
-    const ctrl = controllers[i];
-    const t = setTimeout(() => ctrl.abort(), REQ_TIMEOUT);
-    const onAbort = () => ctrl.abort();
-    if (signal) signal.addEventListener('abort', onAbort, { once: true });
-    return fetchOnce(ep, query, ctrl.signal)
+  const master = new AbortController();
+  const masterTimer = setTimeout(() => master.abort(), 6000);
+  if (signal) signal.addEventListener('abort', () => master.abort(), { once: true });
+
+  const attempts = ENDPOINTS.map((ep) => {
+    return fetchOnce(ep, query, master.signal)
       .then((data) => {
-        clearTimeout(t);
-        if (signal) signal.removeEventListener('abort', onAbort);
-        // abort the others
-        controllers.forEach((c, j) => { if (j !== i) try { c.abort(); } catch {} });
+        // first success wins; abort the rest
+        try { master.abort(); } catch {}
         return { data, source: ep, cached: false };
-      })
-      .catch((e) => {
-        clearTimeout(t);
-        if (signal) signal.removeEventListener('abort', onAbort);
-        throw e;
       });
   });
 
   try {
     const res = await Promise.any(attempts);
+    clearTimeout(masterTimer);
     writeCache(key, res.data);
     return res;
   } catch (agg) {
-    // all mirrors failed
+    clearTimeout(masterTimer);
     const c = readCache(key);
     if (c) return { data: c.data, source: 'cache', cached: true };
     const msg = (agg && agg.errors && agg.errors[0] && agg.errors[0].message) || 'no pubs found';
