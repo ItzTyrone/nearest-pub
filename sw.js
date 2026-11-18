@@ -1,4 +1,4 @@
-const CACHE = 'nearest-pub-v2';
+const CACHE = 'nearest-pub-v3';
 const SHELL = [
   './',
   './index.html',

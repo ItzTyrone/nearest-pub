@@ -8,6 +8,7 @@ const ENDPOINTS = [
 ];
 
 const TTL = 10 * 60 * 1000; // 10 min
+const REQ_TIMEOUT = 5000;
 
 function cacheKey(lat, lon, r) {
   return `pubs:${lat.toFixed(3)}:${lon.toFixed(3)}:${r}`;
@@ -73,31 +74,42 @@ async function fetchOnce(endpoint, query, signal) {
 export async function fetchPubs(lat, lon, radius, { signal } = {}) {
   const key = cacheKey(lat, lon, radius);
   const query = buildQuery(lat, lon, radius);
-  let lastErr = null;
-  for (const ep of ENDPOINTS) {
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 6000);
-      const onAbort = () => ctrl.abort();
-      if (signal) signal.addEventListener('abort', onAbort, { once: true });
-      const data = await fetchOnce(ep, query, ctrl.signal);
-      clearTimeout(t);
-      if (signal) signal.removeEventListener('abort', onAbort);
-      writeCache(key, data);
-      return { data, source: ep, cached: false };
-    } catch (e) {
-      console.warn('endpoint failed', ep, e && e.message);
-      lastErr = e;
-    }
+
+  // race all mirrors in parallel; take the first success
+  const controllers = ENDPOINTS.map(() => new AbortController());
+  const attempts = ENDPOINTS.map((ep, i) => {
+    const ctrl = controllers[i];
+    const t = setTimeout(() => ctrl.abort(), REQ_TIMEOUT);
+    const onAbort = () => ctrl.abort();
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    return fetchOnce(ep, query, ctrl.signal)
+      .then((data) => {
+        clearTimeout(t);
+        if (signal) signal.removeEventListener('abort', onAbort);
+        // abort the others
+        controllers.forEach((c, j) => { if (j !== i) try { c.abort(); } catch {} });
+        return { data, source: ep, cached: false };
+      })
+      .catch((e) => {
+        clearTimeout(t);
+        if (signal) signal.removeEventListener('abort', onAbort);
+        throw e;
+      });
+  });
+
+  try {
+    const res = await Promise.any(attempts);
+    writeCache(key, res.data);
+    return res;
+  } catch (agg) {
+    // all mirrors failed
+    const c = readCache(key);
+    if (c) return { data: c.data, source: 'cache', cached: true };
+    const msg = (agg && agg.errors && agg.errors[0] && agg.errors[0].message) || 'no pubs found';
+    throw new Error(msg);
   }
-  // all endpoints failed — fall back to cache (any age)
-  const c = readCache(key);
-  if (c) return { data: c.data, source: 'cache', cached: true };
-  // last resort: any nearby cached entry
-  throw lastErr || new Error('no pubs found');
 }
 
-// escalate radius until we have at least `want` results
 export async function fetchPubsEscalating(lat, lon, want = 3, { signal } = {}) {
   const radii = [800, 1500, 3000, 6000];
   let last = null;
@@ -110,7 +122,7 @@ export async function fetchPubsEscalating(lat, lon, want = 3, { signal } = {}) {
       if (data.length >= want) return last;
     } catch (e) {
       hardFail = e;
-      break; // network/endpoint failure — larger radii will fail too
+      break;
     }
   }
   if (last && last.data && last.data.length) return last;
